@@ -53,6 +53,7 @@ class Vacancy:
     error_text: str
     analysis_retry_count: int
     analysis_next_retry_at: str | None
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -179,6 +180,7 @@ class Database:
                     company_reviews_count INTEGER,
                     url TEXT NOT NULL,
                     description_hash TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
                     search_query TEXT NOT NULL DEFAULT '',
                     llm_decision INTEGER,
                     llm_reason TEXT NOT NULL DEFAULT '',
@@ -335,6 +337,7 @@ class Database:
                 "fit_summary": "TEXT NOT NULL DEFAULT ''",
                 "analysis_retry_count": "INTEGER NOT NULL DEFAULT 0",
                 "analysis_next_retry_at": "TEXT",
+                "description": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in migrations.items():
                 if name not in columns:
@@ -386,6 +389,7 @@ class Database:
                 company_reviews_count INTEGER,
                 url TEXT NOT NULL,
                 description_hash TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
                 search_query TEXT NOT NULL DEFAULT '',
                 llm_decision INTEGER,
                 llm_reason TEXT NOT NULL DEFAULT '',
@@ -409,7 +413,7 @@ class Database:
             """
         )
         columns = (
-            "id, title, company, url, description_hash, search_query, "
+            "id, title, company, url, description_hash, description, search_query, "
             "llm_decision, llm_reason, confidence, cover_letter, status, "
             "discovered_at, approval_requested_at, approval_expires_at, "
             "approved_at, applied_at, approver_id, permit_hash, error_text, "
@@ -468,6 +472,7 @@ class Database:
             error_text=row["error_text"],
             analysis_retry_count=row["analysis_retry_count"],
             analysis_next_retry_at=row["analysis_next_retry_at"],
+            description=row["description"],
         )
 
     def discover(
@@ -503,6 +508,13 @@ class Database:
                 ),
             )
             return cursor.rowcount == 1
+
+    def store_description(self, job_id: str, description: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE vacancies SET description = ? WHERE id = ?",
+                (description, job_id),
+            )
 
     def store_company_details(
         self, job_id: str, *, rating: float | None, reviews_count: int | None
@@ -628,7 +640,7 @@ class Database:
         cover_letter: str,
         llm_decision: bool,
         llm_reason: str,
-        confidence: float,
+        confidence: float | None = None,
         fit_summary: str = "",
         now: datetime,
     ) -> bool:
@@ -662,7 +674,7 @@ class Database:
         cover_letter: str,
         llm_decision: bool,
         llm_reason: str,
-        confidence: float,
+        confidence: float | None = None,
         fit_summary: str = "",
     ) -> bool:
         with self._connect() as connection:
@@ -934,12 +946,13 @@ class Database:
         start, end = self._day_bounds(now)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            count = connection.execute(
-                "SELECT COUNT(*) FROM llm_requests WHERE started_at >= ? AND started_at < ?",
-                (start, end),
-            ).fetchone()[0]
-            if count >= daily_limit:
-                return None
+            if daily_limit > 0:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM llm_requests WHERE started_at >= ? AND started_at < ?",
+                    (start, end),
+                ).fetchone()[0]
+                if count >= daily_limit:
+                    return None
             cursor = connection.execute(
                 """
                 INSERT INTO llm_requests (provider, model, operation, started_at)
@@ -1033,6 +1046,21 @@ class Database:
                 for row in connection.execute(
                     "SELECT * FROM vacancies WHERE status = ? ORDER BY discovered_at",
                     (VacancyStatus.PENDING_APPROVAL.value,),
+                ).fetchall()
+            ]
+
+    def recent_applied(self, limit: int = 15) -> list[Vacancy]:
+        with self._connect() as connection:
+            return [
+                self._vacancy(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM vacancies
+                    WHERE status = ?
+                    ORDER BY applied_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (VacancyStatus.APPLIED.value, limit),
                 ).fetchall()
             ]
 

@@ -379,7 +379,7 @@ def load_settings(
             max_retries=non_negative_integer("LLM_MAX_RETRIES", "1"),
             temperature=number("LLM_TEMPERATURE", "0"),
             max_output_tokens=positive_integer("LLM_MAX_OUTPUT_TOKENS", "1200"),
-            max_requests_per_day=positive_integer("LLM_MAX_REQUESTS_PER_DAY", "100"),
+            max_requests_per_day=non_negative_integer("LLM_MAX_REQUESTS_PER_DAY", "100"),
             ollama_url=ollama_url,
             mistral_api_key=mistral_api_key,
             mistral_keys_master_key=mistral_keys_master_key,

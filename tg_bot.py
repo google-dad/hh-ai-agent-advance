@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -22,14 +22,16 @@ from aiogram.types import (
     InputRichMessage,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
     RichTextBold,
     RichTextUrl,
 )
 
 from approval import ApprovalService
 from config import Settings
-from database import Database, Vacancy
+from database import Database, Vacancy, VacancyStatus
 from fit_summary import FIT_SUMMARY_FALLBACK
 from llm.errors import LLMError
 from llm.api_keys import ApiKeyCheckResult, ApiKeyManager, ApiKeyView
@@ -40,14 +42,49 @@ from version import __version__
 
 logger = logging.getLogger(__name__)
 PRIVATE_REPLY = "This bot is private."
+CARD_TEXT_LIMIT = 3000
 API_KEY_INPUT_TTL = timedelta(minutes=15)
 # Backward-compatible alias used by older tests/imports.
 MISTRAL_KEY_INPUT_TTL = API_KEY_INPUT_TTL
+MENU_PARSE = "Парсинг"
+MENU_APPROVE = "Апрув"
+MENU_PAUSE = "Пауза"
+MENU_RESUME = "Продолжить"
+MENU_APPLIED = "Отклики"
+MENU_PENDING = "Ожидают"
+MENU_STATUS = "Статус"
+MENU_DIAGNOSTICS = "Диагностика"
+MENU_LABELS = frozenset(
+    {
+        MENU_PARSE,
+        MENU_APPROVE,
+        MENU_PAUSE,
+        MENU_RESUME,
+        MENU_APPLIED,
+        MENU_PENDING,
+        MENU_STATUS,
+        MENU_DIAGNOSTICS,
+    }
+)
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=MENU_PARSE), KeyboardButton(text=MENU_APPROVE)],
+            [KeyboardButton(text=MENU_PAUSE), KeyboardButton(text=MENU_RESUME)],
+            [KeyboardButton(text=MENU_APPLIED), KeyboardButton(text=MENU_PENDING)],
+            [KeyboardButton(text=MENU_STATUS), KeyboardButton(text=MENU_DIAGNOSTICS)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 @dataclass
 class AgentControl:
     paused: bool = False
+    app_mode: str = ""
     circuit_reason: str = ""
     consecutive_search_errors: int = 0
     next_run_at: datetime | None = None
@@ -64,6 +101,12 @@ class ApiKeyInputSession:
 MistralKeyInputSession = ApiKeyInputSession
 
 
+class CoverLetterGenerator(Protocol):
+    async def generate_cover_letter(
+        self, vacancy_title: str, vacancy_description: str
+    ) -> str: ...
+
+
 class TelegramService:
     def __init__(
         self,
@@ -77,11 +120,13 @@ class TelegramService:
         bot: Any | None = None,
         dispatcher: Dispatcher | None = None,
         now_factory: Callable[[], datetime] | None = None,
+        cover_letters: CoverLetterGenerator | None = None,
     ):
         self.settings = settings
         self.database = database
         self.approval_service = approval_service
         self.control = control
+        self.cover_letters = cover_letters
         self.api_keys = api_keys if api_keys is not None else mistral_keys
         self.mistral_keys = self.api_keys  # backward-compatible attribute
         self.bot = bot or Bot(token=settings.tg_bot_token)
@@ -102,7 +147,10 @@ class TelegramService:
         if not self.authorized(user_id):
             return PRIVATE_REPLY
         if name == "start":
-            return "Personal HH assistant is ready. Use /status to inspect it."
+            return (
+                "Personal HH assistant is ready. "
+                "Кнопки под полем ввода: режим, пауза, отклики и статус."
+            )
         if name == "pause":
             self.control.paused = True
             self.control.next_run_at = None
@@ -124,7 +172,7 @@ class TelegramService:
                 version_str += f" (доступно обновление {self.latest_release.tag_name})"
             return (
                 f"версия: {version_str}\n"
-                f"mode: {self.settings.app_mode}\n"
+                f"mode: {self._app_mode()}\n"
                 f"state: {'paused' if self.control.paused else 'running'}\n"
                 f"processed: {processed}\n"
                 f"applied today: {self.database.applied_today(self.now_factory())}"
@@ -151,6 +199,44 @@ class TelegramService:
                 self._edit_future.set_result(None)
             return "Current input request cancelled."
         return "Unknown command."
+
+    def _app_mode(self) -> str:
+        return self.control.app_mode or self.settings.app_mode
+
+    def menu_text(self, label: str, user_id: int) -> str | None:
+        if label not in MENU_LABELS:
+            return None
+        if not self.authorized(user_id):
+            return PRIVATE_REPLY
+        if label == MENU_PARSE:
+            self.control.app_mode = "dry_run"
+            logger.info("agent_mode_changed app_mode=dry_run")
+            return "Режим: парсинг. Новые карточки без кнопок отклика."
+        if label == MENU_APPROVE:
+            self.control.app_mode = "approval"
+            logger.info("agent_mode_changed app_mode=approval")
+            return "Режим: апрув. Новые карточки с письмом и откликом."
+        if label == MENU_PAUSE:
+            return self.command("pause", user_id)
+        if label == MENU_RESUME:
+            return self.command("resume", user_id)
+        if label == MENU_APPLIED:
+            return self._applied_list()
+        if label == MENU_PENDING:
+            return self.command("pending", user_id)
+        if label == MENU_STATUS:
+            return self.command("status", user_id)
+        return self.command("diagnostics", user_id)
+
+    def _applied_list(self) -> str:
+        items = self.database.recent_applied(limit=15)
+        if not items:
+            return "Откликов нет."
+        lines = []
+        for item in items:
+            company = f" — {item.company}" if item.company else ""
+            lines.append(f"{item.title}{company}\n{item.url}")
+        return "\n\n".join(lines)
 
     def _diagnostics(self) -> str:
         run = self.database.latest_search_run()
@@ -220,6 +306,7 @@ class TelegramService:
             F.data.startswith("apply:")
             | F.data.startswith("skip:")
             | F.data.startswith("edit:")
+            | F.data.startswith("letter:")
             | F.data.startswith("mk:"),
         )
         self.dispatcher.message.register(self._text_handler)
@@ -236,7 +323,11 @@ class TelegramService:
             self._mistral_key_input = None
             await message.answer("Current API key input cancelled.")
             return
-        await message.answer(self.command(name, message.from_user.id))
+        reply = self.command(name, message.from_user.id)
+        if name == "start" and self.authorized(message.from_user.id):
+            await message.answer(reply, reply_markup=main_menu_keyboard())
+            return
+        await message.answer(reply)
 
     async def _callback_handler(self, callback: CallbackQuery) -> None:
         if not self.authorized(callback.from_user.id):
@@ -251,12 +342,14 @@ class TelegramService:
         if action == "mk":
             await self._mistral_key_callback(callback, (callback.data or "").split(":"))
             return
-        if not separator or action not in {"apply", "skip", "edit"} or not job_id:
+        if not separator or action not in {"apply", "skip", "edit", "letter"} or not job_id:
             await self._answer_callback(
                 callback, "Некорректное действие.", show_alert=True
             )
             return
-        if action == "apply":
+        if action == "letter":
+            await self._generate_letter(callback, job_id)
+        elif action == "apply":
             # Отвечаем на callback немедленно — Telegram требует ответ в течение ~10 сек,
             # а браузерный отклик может занять значительно больше времени.
             await callback.answer("⏳ Отправляем отклик...", show_alert=False)
@@ -559,6 +652,9 @@ class TelegramService:
             return
         key_session = self._mistral_key_input
         if key_session is None:
+            reply = self.menu_text(text, message.from_user.id)
+            if reply is not None:
+                await message.answer(reply, reply_markup=main_menu_keyboard())
             return
         if self.now_factory() >= key_session.expires_at:
             self._mistral_key_input = None
@@ -581,26 +677,36 @@ class TelegramService:
             return
         await message.answer(f"Ключ {result.id} ····{result.suffix} добавлен.")
 
+    async def _generate_letter(self, callback: CallbackQuery, job_id: str) -> None:
+        await callback.answer("Готовлю сопроводительное письмо...")
+        vacancy = self.database.get(job_id)
+        if vacancy is None or vacancy.status is not VacancyStatus.PENDING_APPROVAL:
+            await self.notify("Вакансия уже не ожидает решения.")
+            return
+        if not vacancy.description.strip():
+            await self.notify("Текст вакансии не сохранён, письмо не собрать.")
+            return
+        if self.cover_letters is None:
+            await self.notify("Генерация письма недоступна.")
+            return
+        letter = await self.cover_letters.generate_cover_letter(
+            vacancy.title, vacancy.description
+        )
+        if not letter.strip():
+            await self.notify("Не удалось составить письмо. Нажмите кнопку ещё раз.")
+            return
+        self.database.update_cover_letter(job_id, letter)
+        updated = self.database.get(job_id)
+        if callback.message is not None:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramAPIError:
+                logger.warning("telegram_clear_keyboard_failed job_id=%s", job_id)
+        if updated is not None:
+            await self.send_preview(updated, include_actions=True)
+
     async def send_preview(self, vacancy: Vacancy, include_actions: bool) -> None:
-        keyboard = None
-        if include_actions:
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Откликнуться", callback_data=f"apply:{vacancy.id}"
-                        ),
-                        InlineKeyboardButton(
-                            text="Пропустить", callback_data=f"skip:{vacancy.id}"
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="✏️ Изменить письмо", callback_data=f"edit:{vacancy.id}"
-                        ),
-                    ],
-                ]
-            )
+        keyboard = self._action_keyboard(vacancy) if include_actions else None
         try:
             await self.bot.send_rich_message(
                 chat_id=self.settings.tg_user_id,
@@ -623,6 +729,45 @@ class TelegramService:
         )
 
     @staticmethod
+    def _action_keyboard(vacancy: Vacancy) -> InlineKeyboardMarkup:
+        if vacancy.cover_letter.strip():
+            rows = [
+                [
+                    InlineKeyboardButton(
+                        text="Откликнуться", callback_data=f"apply:{vacancy.id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Пропустить", callback_data=f"skip:{vacancy.id}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="✏️ Изменить письмо", callback_data=f"edit:{vacancy.id}"
+                    ),
+                ],
+            ]
+        else:
+            rows = [
+                [
+                    InlineKeyboardButton(
+                        text="Сгенерировать письмо",
+                        callback_data=f"letter:{vacancy.id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Пропустить", callback_data=f"skip:{vacancy.id}"
+                    ),
+                ]
+            ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _clip(text: str, limit: int = CARD_TEXT_LIMIT) -> str:
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1].rstrip() + "…"
+
+    @staticmethod
     def _confidence(vacancy: Vacancy) -> str:
         return "нет данных" if vacancy.confidence is None else f"{vacancy.confidence:.0%}"
 
@@ -635,9 +780,12 @@ class TelegramService:
 
     @staticmethod
     def _fit_lines(vacancy: Vacancy) -> list[tuple[str, str]]:
+        source = vacancy.fit_summary or (
+            FIT_SUMMARY_FALLBACK if vacancy.confidence is not None else ""
+        )
         return [
             (category, value)
-            for line in (vacancy.fit_summary or FIT_SUMMARY_FALLBACK).splitlines()
+            for line in source.splitlines()
             for category, separator, value in [line.partition(": ")]
             if separator
         ]
@@ -655,34 +803,56 @@ class TelegramService:
                     text=[RichTextBold(text="Рейтинг HH: "), rating]
                 )
             )
-        return InputRichMessage(
-            skip_entity_detection=True,
-            blocks=[
-                InputRichBlockSectionHeading(text=vacancy.title, size=2),
+        blocks: list[Any] = [
+            InputRichBlockSectionHeading(text=vacancy.title, size=2),
+            InputRichBlockParagraph(
+                text=RichTextUrl(text="Открыть вакансию", url=vacancy.url)
+            ),
+            InputRichBlockDivider(),
+            InputRichBlockDetails(
+                summary="Компания", blocks=company_blocks, is_open=True
+            ),
+        ]
+        if vacancy.search_query:
+            blocks.append(
                 InputRichBlockParagraph(
-                    text=RichTextUrl(text="Открыть вакансию", url=vacancy.url)
-                ),
-                InputRichBlockDivider(),
+                    text=[RichTextBold(text="Запрос: "), vacancy.search_query]
+                )
+            )
+        if vacancy.description.strip():
+            blocks.append(
                 InputRichBlockDetails(
-                    summary="Компания", blocks=company_blocks, is_open=True
-                ),
-                InputRichBlockSectionHeading(text="Почему мне подходит", size=3),
-                *[
-                    InputRichBlockParagraph(
-                        text=[RichTextBold(text=f"{category}: "), value]
-                    )
-                    for category, value in cls._fit_lines(vacancy)
-                ],
+                    summary="Текст вакансии",
+                    blocks=[
+                        InputRichBlockParagraph(text=cls._clip(vacancy.description))
+                    ],
+                    is_open=False,
+                )
+            )
+        fit_lines = cls._fit_lines(vacancy)
+        if fit_lines:
+            blocks.append(InputRichBlockSectionHeading(text="Почему мне подходит", size=3))
+            blocks.extend(
+                InputRichBlockParagraph(
+                    text=[RichTextBold(text=f"{category}: "), value]
+                )
+                for category, value in fit_lines
+            )
+        if vacancy.confidence is not None:
+            blocks.append(
                 InputRichBlockParagraph(
                     text=[RichTextBold(text="Уверенность: "), cls._confidence(vacancy)]
-                ),
+                )
+            )
+        if vacancy.cover_letter.strip():
+            blocks.append(
                 InputRichBlockDetails(
                     summary="Сопроводительное письмо",
                     blocks=[InputRichBlockParagraph(text=vacancy.cover_letter)],
                     is_open=False,
-                ),
-            ],
-        )
+                )
+            )
+        return InputRichMessage(skip_entity_detection=True, blocks=blocks)
 
     @classmethod
     def _html_card(cls, vacancy: Vacancy) -> str:
@@ -691,18 +861,34 @@ class TelegramService:
         company_text = f"<b>Компания</b>\nКомпания: {company}"
         if rating:
             company_text += f"\nРейтинг HH: {rating}"
-        fit_text = "\n".join(
-            f"<b>{html.escape(category)}:</b> {html.escape(value)}"
-            for category, value in cls._fit_lines(vacancy)
-        )
-        return (
-            f"<b>{html.escape(vacancy.title)}</b>\n"
-            f"<a href=\"{html.escape(vacancy.url, quote=True)}\">Открыть вакансию</a>\n\n"
-            f"{company_text}\n\n"
-            f"<b>Почему мне подходит</b>\n{fit_text}\n"
-            f"Уверенность: {cls._confidence(vacancy)}\n\n"
-            f"<b>Сопроводительное письмо</b>\n{html.escape(vacancy.cover_letter)}"
-        )
+        parts = [
+            f"<b>{html.escape(vacancy.title)}</b>",
+            f"<a href=\"{html.escape(vacancy.url, quote=True)}\">Открыть вакансию</a>",
+            "",
+            company_text,
+        ]
+        if vacancy.search_query:
+            parts.extend(["", f"<b>Запрос:</b> {html.escape(vacancy.search_query)}"])
+        description = cls._clip(vacancy.description)
+        if description:
+            parts.extend(["", f"<b>Текст вакансии</b>\n{html.escape(description)}"])
+        fit_lines = cls._fit_lines(vacancy)
+        if fit_lines:
+            fit_text = "\n".join(
+                f"<b>{html.escape(category)}:</b> {html.escape(value)}"
+                for category, value in fit_lines
+            )
+            parts.extend(["", f"<b>Почему мне подходит</b>\n{fit_text}"])
+        if vacancy.confidence is not None:
+            parts.append(f"Уверенность: {cls._confidence(vacancy)}")
+        if vacancy.cover_letter.strip():
+            parts.extend(
+                ["", f"<b>Сопроводительное письмо</b>\n{html.escape(vacancy.cover_letter)}"]
+            )
+        text = "\n".join(parts)
+        if len(text) <= 4096:
+            return text
+        return text[:4095] + "…"
 
     async def notify(self, text: str) -> None:
         try:

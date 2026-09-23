@@ -13,12 +13,11 @@ from pathlib import Path
 
 from aiogram.exceptions import TelegramAPIError
 
-from ai_analyzer import AnalysisError, VacancyAnalyzer
+from ai_analyzer import VacancyAnalyzer
 from approval import ApprovalGuard, ApprovalService
 from browser_backend import BrowserLaunchError, create_browser_backend
 from config import ConfigError, Settings, load_settings
 from database import Database, SearchRun, VacancyStatus
-from fit_summary import normalize_fit_summary
 from hh_client import HHClient, PageState, VacancySummary
 from llm.api_keys import ApiKeyManager
 from llm.base import LLMProvider
@@ -102,12 +101,18 @@ class SearchRunStats:
         return ""
 
 
+def live_app_mode(settings: Settings, telegram: object) -> str:
+    control = getattr(telegram, "control", None)
+    mode = getattr(control, "app_mode", "") if control is not None else ""
+    return mode or settings.app_mode
+
+
 async def process_vacancy(
     summary: VacancySummary,
     settings: Settings,
     database: Database,
     hh_client: HHClient,
-    analyzer: VacancyAnalyzer,
+    _analyzer: VacancyAnalyzer,
     telegram: TelegramService,
     *,
     now_factory: Callable[[], datetime] | None = None,
@@ -119,7 +124,10 @@ async def process_vacancy(
         if existing is None or existing.status is not VacancyStatus.PENDING_APPROVAL:
             return VacancyProcessResult("ignored")
         try:
-            await telegram.send_preview(existing, include_actions=True)
+            await telegram.send_preview(
+                existing,
+                include_actions=live_app_mode(settings, telegram) != "dry_run",
+            )
         except TelegramAPIError:
             return VacancyProcessResult("other_error", "telegram_error")
         return VacancyProcessResult("telegram_card")
@@ -128,6 +136,30 @@ async def process_vacancy(
         or existing.llm_decision is not None
     ):
         return VacancyProcessResult("ignored")
+    rejection = title_rejection_reason(
+        summary.title, settings.profile.candidate.excluded_positions
+    )
+    if rejection:
+        if existing is None and not database.discover(
+            job_id=summary.id,
+            title=summary.title,
+            company="",
+            url=summary.url,
+            description_hash="",
+            search_query=summary.search_query,
+            discovered_at=now,
+        ):
+            return VacancyProcessResult("ignored")
+        if existing is None:
+            logger.info("vacancy_discovered job_id=%s", summary.id)
+        database.transition(
+            summary.id,
+            VacancyStatus.DISCOVERED,
+            VacancyStatus.REJECTED_BY_FILTER,
+            llm_reason=f"Title matched excluded term: {rejection}",
+        )
+        logger.info("vacancy_rejected job_id=%s source=filter", summary.id)
+        return VacancyProcessResult("rejected_by_filter", rejection)
     details = await hh_client.read_vacancy(summary, telegram.request_captcha)
     description_hash = (
         hashlib.sha256(details.description.encode()).hexdigest()
@@ -162,92 +194,35 @@ async def process_vacancy(
         logger.error("vacancy_read_failed job_id=%s state=%s", summary.id, details.state.value)
         return VacancyProcessResult("other_error", details.state.value, details.state)
 
-    rejection = title_rejection_reason(
-        summary.title, settings.profile.candidate.excluded_positions
-    )
-    if rejection:
-        database.transition(
-            summary.id,
-            VacancyStatus.DISCOVERED,
-            VacancyStatus.REJECTED_BY_FILTER,
-            llm_reason=f"Title matched excluded term: {rejection}",
-        )
-        logger.info("vacancy_rejected job_id=%s source=filter", summary.id)
-        return VacancyProcessResult(
-            "rejected_by_filter", rejection, PageState.VACANCY_LOADED
-        )
-
-    try:
-        suitability = await analyzer.assess(summary.title, details.description)
-    except AnalysisError as exc:
-        database.mark_analysis_failed(
-            summary.id,
-            error_type=exc.error_type,
-            now=clock(),
-            retry_after=timedelta(minutes=settings.check_interval_minutes),
-            max_attempts=ANALYSIS_MAX_ATTEMPTS,
-        )
-        await telegram.notify_analysis_failed(summary.title, summary.url, exc.error_type)
-        logger.warning("vacancy_analysis_failed job_id=%s error_type=%s", summary.id, exc.error_type)
-        return VacancyProcessResult(
-            "other_error",
-            f"analysis_failed:{exc.error_type}",
-            PageState.VACANCY_LOADED,
-        )
-
-    if not suitability.suitable:
-        database.transition(
-            summary.id,
-            VacancyStatus.DISCOVERED,
-            VacancyStatus.REJECTED_BY_LLM,
-            llm_decision=False,
-            llm_reason=suitability.reason,
-            confidence=suitability.confidence,
-            error_text="",
-        )
-        logger.info("vacancy_rejected job_id=%s source=llm", summary.id)
-        return VacancyProcessResult(
-            "rejected_by_llm", suitability.reason, PageState.VACANCY_LOADED
-        )
-
-    fit_summary = normalize_fit_summary(suitability.fit_points)
+    database.store_description(summary.id, details.description)
     company = await hh_client.read_company_details(details.company_url)
     database.store_company_details(
         summary.id, rating=company.rating, reviews_count=company.reviews_count
     )
 
-    letter = await analyzer.generate_cover_letter(summary.title, details.description)
-    if not letter.strip():
-        database.transition(
-            summary.id,
-            VacancyStatus.DISCOVERED,
-            VacancyStatus.APPLY_FAILED,
-            error_text="cover_letter_failed",
-        )
-        await telegram.notify_analysis_failed(summary.title, summary.url, "cover_letter_failed")
-        return VacancyProcessResult(
-            "other_error", "cover_letter_failed", PageState.VACANCY_LOADED
-        )
-
-    include_actions = settings.app_mode != "dry_run"
-    if settings.app_mode == "dry_run":
+    mode = live_app_mode(settings, telegram)
+    include_actions = mode != "dry_run"
+    queued = (
         database.store_analysis(
             summary.id,
-            cover_letter=letter,
+            cover_letter="",
             llm_decision=True,
-            llm_reason=suitability.reason,
-            confidence=suitability.confidence,
-            fit_summary=fit_summary,
+            llm_reason="",
+            confidence=None,
+            fit_summary="",
         )
-    elif not database.request_approval(
-        job_id=summary.id,
-        cover_letter=letter,
-        llm_decision=True,
-        llm_reason=suitability.reason,
-        confidence=suitability.confidence,
-        fit_summary=fit_summary,
-        now=now,
-    ):
+        if mode == "dry_run"
+        else database.request_approval(
+            job_id=summary.id,
+            cover_letter="",
+            llm_decision=True,
+            llm_reason="",
+            confidence=None,
+            fit_summary="",
+            now=now,
+        )
+    )
+    if not queued:
         return VacancyProcessResult(
             "other_error", "approval_transition_failed", PageState.VACANCY_LOADED
         )
@@ -497,18 +472,25 @@ async def run(settings: Settings) -> None:
     telegram: TelegramService | None = None
     try:
         context = await backend.start()
-        guard = ApprovalGuard(settings, database)
+        control = AgentControl(app_mode=settings.app_mode)
+        guard = ApprovalGuard(settings, database, control=control)
         hh_client = HHClient(context, settings, database, guard)
         if not await hh_client.ensure_login():
             raise RuntimeError(
                 "HH.ru login is required. Run with BROWSER_HEADLESS=false and sign in manually."
             )
-        control = AgentControl()
-        approval_service = ApprovalService(settings, database, hh_client)
-        telegram = TelegramService(
-            settings, database, approval_service, control, api_keys=api_keys
+        approval_service = ApprovalService(
+            settings, database, hh_client, control=control
         )
         analyzer = VacancyAnalyzer(settings, llm_provider)
+        telegram = TelegramService(
+            settings,
+            database,
+            approval_service,
+            control,
+            api_keys=api_keys,
+            cover_letters=analyzer,
+        )
         if api_keys is not None:
             api_keys.set_notifier(telegram.notify)
         if hasattr(telegram, "check_updates"):

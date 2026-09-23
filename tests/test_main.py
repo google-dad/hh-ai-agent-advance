@@ -35,7 +35,7 @@ from tg_bot import AgentControl
 
 NOW = datetime(2026, 7, 26, 9, 0, tzinfo=UTC)
 SUMMARY = VacancySummary(
-    "job-1", "Python developer", "https://example.com/vacancy/job-1", "Python"
+    "job-1", "SEO-специалист", "https://example.com/vacancy/job-1", "SEO"
 )
 
 
@@ -252,8 +252,9 @@ def test_dry_run_records_and_previews_without_pending_actions(tmp_path: Path) ->
 
     vacancy = database.get("job-1")
     assert vacancy.status is VacancyStatus.DISCOVERED
-    assert vacancy.cover_letter == "Safe local-profile letter"
-    assert vacancy.fit_summary.startswith("Навыки: Python")
+    assert vacancy.cover_letter == ""
+    assert vacancy.description == "Build Python services"
+    assert vacancy.llm_decision is True
     assert vacancy.company_rating == 4.7
     assert telegram.previews == [("job-1", False)]
 
@@ -279,8 +280,80 @@ def test_approval_mode_records_pending_and_sends_actions(tmp_path: Path) -> None
         )
     )
 
-    assert database.get("job-1").status is VacancyStatus.PENDING_APPROVAL
+    vacancy = database.get("job-1")
+    assert vacancy.status is VacancyStatus.PENDING_APPROVAL
+    assert vacancy.cover_letter == ""
+    assert vacancy.description == "Build Python services"
     assert telegram.previews == [("job-1", True)]
+
+
+def test_runtime_parse_mode_sends_cards_without_actions(tmp_path: Path) -> None:
+    app_settings = settings(tmp_path, "approval")
+    database = Database(app_settings.database_path)
+    database.init()
+    telegram = FakeTelegram()
+    telegram.control = AgentControl(app_mode="dry_run")
+    details = VacancyDetails(
+        SUMMARY, PageState.VACANCY_LOADED, "Example", "Build Python services"
+    )
+
+    asyncio.run(
+        process_vacancy(
+            SUMMARY,
+            app_settings,
+            database,
+            FakeHHClient(details),
+            FakeAnalyzer(),
+            telegram,
+            now_factory=lambda: NOW,
+        )
+    )
+
+    vacancy = database.get("job-1")
+    assert vacancy.status is VacancyStatus.DISCOVERED
+    assert vacancy.llm_decision is True
+    assert telegram.previews == [("job-1", False)]
+
+
+def test_pending_card_resend_follows_runtime_mode(tmp_path: Path) -> None:
+    app_settings = settings(tmp_path, "approval")
+    database = Database(app_settings.database_path)
+    database.init()
+    assert database.discover(
+        job_id=SUMMARY.id,
+        title=SUMMARY.title,
+        company="Example",
+        url=SUMMARY.url,
+        description_hash="hash",
+        search_query=SUMMARY.search_query,
+        discovered_at=NOW,
+    )
+    assert database.request_approval(
+        job_id=SUMMARY.id,
+        cover_letter="",
+        llm_decision=True,
+        llm_reason="",
+        now=NOW,
+    )
+    telegram = FakeTelegram()
+    telegram.control = AgentControl(app_mode="dry_run")
+
+    asyncio.run(
+        process_vacancy(
+            replace(SUMMARY, previously_sent=True),
+            app_settings,
+            database,
+            FakeHHClient(
+                VacancyDetails(SUMMARY, PageState.VACANCY_LOADED, "Example", "text")
+            ),
+            FakeAnalyzer(),
+            telegram,
+            now_factory=lambda: NOW,
+        )
+    )
+
+    assert telegram.previews == [("job-1", False)]
+    assert database.get("job-1").status is VacancyStatus.PENDING_APPROVAL
 
 
 def test_browser_read_error_is_persisted_as_apply_failed(tmp_path: Path) -> None:
@@ -309,9 +382,7 @@ def test_browser_read_error_is_persisted_as_apply_failed(tmp_path: Path) -> None
     assert "navigation failed" in vacancy.error_text
 
 
-def test_llm_failure_records_analysis_failure_without_requesting_approval(
-    tmp_path: Path,
-) -> None:
+def test_loaded_vacancy_is_queued_without_calling_the_model(tmp_path: Path) -> None:
     app_settings = settings(tmp_path, "approval")
     database = Database(app_settings.database_path)
     database.init()
@@ -325,6 +396,7 @@ def test_llm_failure_records_analysis_failure_without_requesting_approval(
     details = VacancyDetails(
         SUMMARY, PageState.VACANCY_LOADED, "Example", "Build Python services"
     )
+    analyzer = VacancyAnalyzer(app_settings, provider)
 
     asyncio.run(
         process_vacancy(
@@ -332,23 +404,18 @@ def test_llm_failure_records_analysis_failure_without_requesting_approval(
             app_settings,
             database,
             FakeHHClient(details),
-            VacancyAnalyzer(app_settings, provider),
+            analyzer,
             telegram,
             now_factory=lambda: NOW,
         )
     )
 
     vacancy = database.get("job-1")
-    assert vacancy.status is VacancyStatus.ANALYSIS_FAILED
-    assert vacancy.llm_decision is None
-    assert vacancy.error_text == "authentication"
-    assert vacancy.analysis_retry_count == 1
-    assert vacancy.analysis_next_retry_at == (
-        NOW + timedelta(minutes=app_settings.check_interval_minutes)
-    ).isoformat()
+    assert vacancy.status is VacancyStatus.PENDING_APPROVAL
     assert vacancy.cover_letter == ""
-    assert telegram.previews == []
-    assert telegram.notifications == ["analysis_failed:authentication"]
+    assert vacancy.description == "Build Python services"
+    assert telegram.previews == [("job-1", True)]
+    assert telegram.notifications == []
 
 
 def test_analysis_retry_delay_starts_when_failed_analysis_finishes(
@@ -375,11 +442,11 @@ def test_analysis_retry_delay_starts_when_failed_analysis_finishes(
         )
     )
 
-    assert database.get(SUMMARY.id).analysis_next_retry_at == (
-        NOW
-        + timedelta(minutes=5)
-        + timedelta(minutes=app_settings.check_interval_minutes)
-    ).isoformat()
+    vacancy = database.get(SUMMARY.id)
+    assert vacancy.status is VacancyStatus.PENDING_APPROVAL
+    assert vacancy.cover_letter == ""
+    assert vacancy.description == "Build Python services"
+    assert telegram.previews == [(SUMMARY.id, True)]
 
 
 def test_failed_retry_delay_starts_when_retry_finishes(tmp_path: Path) -> None:
@@ -427,12 +494,9 @@ def test_failed_retry_delay_starts_when_retry_finishes(tmp_path: Path) -> None:
     )
 
     vacancy = database.get(SUMMARY.id)
-    assert vacancy.analysis_retry_count == 2
-    assert vacancy.analysis_next_retry_at == (
-        NOW
-        + timedelta(minutes=35)
-        + timedelta(minutes=app_settings.check_interval_minutes)
-    ).isoformat()
+    assert vacancy.status is VacancyStatus.PENDING_APPROVAL
+    assert vacancy.cover_letter == ""
+    assert telegram.previews == [(SUMMARY.id, True)]
 
 
 def test_pause_stops_retry_backlog_before_next_vacancy(tmp_path: Path) -> None:
@@ -440,7 +504,7 @@ def test_pause_stops_retry_backlog_before_next_vacancy(tmp_path: Path) -> None:
     database = Database(app_settings.database_path)
     database.init()
     second = VacancySummary(
-        "job-2", "Backend developer", "https://example.com/vacancy/job-2", "Python"
+        "job-2", "линкбилдер", "https://example.com/vacancy/job-2", "линкбилдер"
     )
     for offset, summary in enumerate((SUMMARY, second)):
         discovered_at = NOW + timedelta(seconds=offset)
@@ -478,9 +542,9 @@ def test_pause_stops_retry_backlog_before_next_vacancy(tmp_path: Path) -> None:
         )
     )
 
-    assert analyzer.calls == 1
+    assert analyzer.calls == 0
     assert database.get(SUMMARY.id).status is VacancyStatus.PENDING_APPROVAL
-    assert database.get(second.id).status is VacancyStatus.DISCOVERED
+    assert database.get(second.id).status is VacancyStatus.PENDING_APPROVAL
 
 
 def test_three_timeouts_are_retried_in_later_cycle(tmp_path: Path) -> None:
@@ -531,24 +595,11 @@ def test_three_timeouts_are_retried_in_later_cycle(tmp_path: Path) -> None:
             now_factory=lambda: NOW,
         )
     )
-    assert database.get(SUMMARY.id).status is VacancyStatus.ANALYSIS_FAILED
-
-    asyncio.run(
-        main_module.retry_due_analyses(
-            app_settings,
-            database,
-            FakeHHClient(details),
-            analyzer,
-            telegram,
-            AgentControl(),
-            now_factory=lambda: NOW + timedelta(minutes=30),
-        )
-    )
-
     vacancy = database.get(SUMMARY.id)
     assert vacancy.status is VacancyStatus.PENDING_APPROVAL
+    assert vacancy.cover_letter == ""
     assert vacancy.llm_decision is True
-    assert len(adapter.requests) == 5
+    assert adapter.requests == []
 
 
 def test_agent_loop_retries_due_analysis_before_new_search(tmp_path: Path) -> None:
@@ -691,11 +742,11 @@ def test_retry_uses_valid_negative_decision_instead_of_technical_error(
     )
 
     vacancy = database.get(SUMMARY.id)
-    assert vacancy.status is VacancyStatus.REJECTED_BY_LLM
-    assert vacancy.llm_decision is False
-    assert vacancy.llm_reason == "Role mismatch"
-    assert vacancy.error_text == ""
-    assert telegram.previews == []
+    assert vacancy.status is VacancyStatus.PENDING_APPROVAL
+    assert vacancy.llm_decision is True
+    assert vacancy.cover_letter == ""
+    assert vacancy.llm_reason == ""
+    assert telegram.previews == [(SUMMARY.id, True)]
 
 
 def test_cli_reports_configuration_error_without_traceback(tmp_path: Path) -> None:

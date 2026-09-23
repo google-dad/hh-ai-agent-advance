@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from approval import ApplicationPermission, ApprovalGuard, ApprovalService
+from tg_bot import AgentControl
 from config import load_settings
 from database import Database, VacancyStatus
 from hh_client import HHClient
@@ -225,6 +226,32 @@ def test_approval_service_is_the_valid_path_to_physical_submit(tmp_path: Path) -
     assert page.clicks == ["open_response", "final_submit"]
     assert all("text=" not in selector for selector in page.selectors)
     assert database.get("job-1").status is VacancyStatus.APPLIED
+
+
+class RejectingSender:
+    async def submit_application(self, _permission: ApplicationPermission) -> bool:
+        raise AssertionError("submit must not run")
+
+
+def test_runtime_parse_mode_blocks_apply(tmp_path: Path) -> None:
+    app_settings = settings(
+        tmp_path, APP_MODE="approval", ENABLE_REAL_APPLY="true", TG_USER_ID="42"
+    )
+    database = Database(app_settings.database_path)
+    database.init()
+    pending(database)
+    service = ApprovalService(
+        app_settings,
+        database,
+        RejectingSender(),
+        control=AgentControl(app_mode="dry_run"),
+    )
+
+    result = asyncio.run(service.approve_and_apply("job-1", 42))
+
+    assert not result.ok
+    assert result.message == "Real applications are disabled in dry-run"
+    assert database.get("job-1").status is VacancyStatus.PENDING_APPROVAL
 
 
 def test_browser_error_after_claim_becomes_apply_failed(tmp_path: Path) -> None:

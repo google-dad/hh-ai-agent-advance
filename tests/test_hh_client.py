@@ -515,7 +515,12 @@ def test_captcha_solution_uses_submit_button(tmp_path: Path) -> None:
         ("Intern Python developer", (), "intern"),
         ("Python sales engineer", ("sales",), "sales"),
         ("Senior SEO Team Lead", (), None),
-        ("Python developer", (), None),
+        ("Python developer", (), "no-role"),
+        ("Менеджер по продажам", (), "продаж"),
+        ("Facebook маркетолог", (), "facebook"),
+        ("Интернет-маркетолог", (), None),
+        ("маркетолог по продажам", (), "продаж"),
+        ("линкбилдер", (), None),
     ],
 )
 def test_title_filter_returns_the_matched_reason(

@@ -245,9 +245,157 @@ def test_approval_preview_has_apply_and_skip_buttons(tmp_path: Path) -> None:
     assert [button.callback_data for button in buttons] == ["apply:job-1", "skip:job-1"]
 
 
+def test_vacancy_without_letter_shows_text_and_generate_button(tmp_path: Path) -> None:
+    telegram, database, _, bot = service(tmp_path, "approval")
+    assert database.discover(
+        job_id="job-2",
+        title="SEO-специалист",
+        company="Example",
+        url="https://example.com/vacancy/job-2",
+        description_hash="hash",
+        search_query="SEO-специалист",
+        discovered_at=NOW,
+    )
+    database.store_description("job-2", "Технический аудит и семантика.")
+    assert database.request_approval(
+        job_id="job-2",
+        cover_letter="",
+        llm_decision=True,
+        llm_reason="",
+        now=NOW,
+    )
+
+    asyncio.run(telegram.send_preview(database.get("job-2"), include_actions=True))
+
+    message = bot.rich_messages[0]
+    buttons = message["reply_markup"].inline_keyboard[0]
+    assert [button.text for button in buttons] == ["Сгенерировать письмо", "Пропустить"]
+    assert [button.callback_data for button in buttons] == ["letter:job-2", "skip:job-2"]
+    rendered = repr(message["rich_message"].blocks)
+    assert "Текст вакансии" in rendered
+    assert "Технический аудит и семантика." in rendered
+    assert "Запрос" in rendered
+
+
 def test_pending_and_stats_read_sqlite(tmp_path: Path) -> None:
     telegram, database, _, _ = service(tmp_path, "approval")
     add_preview_vacancy(database)
 
     assert "job-1" in telegram.command("pending", user_id=42)
     assert "pending_approval: 1" in telegram.command("stats", user_id=42)
+
+
+class FakeUser:
+    def __init__(self, user_id: int):
+        self.id = user_id
+
+
+class FakeMessage:
+    def __init__(self, text: str, user_id: int = 42):
+        self.text = text
+        self.from_user = FakeUser(user_id)
+        self.replies: list[dict] = []
+
+    async def answer(self, text: str, **kwargs):
+        self.replies.append({"text": text, **kwargs})
+
+
+def record_application(
+    database: Database,
+    job_id: str,
+    title: str,
+    company: str,
+    applied_at: datetime,
+) -> None:
+    assert database.discover(
+        job_id=job_id,
+        title=title,
+        company=company,
+        url=f"https://example.com/vacancy/{job_id}",
+        description_hash=job_id,
+        search_query="SEO",
+        discovered_at=applied_at,
+    )
+    assert database.request_approval(
+        job_id=job_id,
+        cover_letter="Letter",
+        llm_decision=True,
+        llm_reason="",
+        now=applied_at,
+    )
+    token = database.approve(job_id, 42, 42, applied_at)
+    assert token
+    assert database.claim_application(
+        job_id=job_id,
+        permit=token,
+        telegram_user_id=42,
+        expected_user_id=42,
+        app_mode="approval",
+        enable_real_apply=True,
+        daily_limit=10,
+        now=applied_at,
+    ).allowed
+    assert database.complete_application(
+        job_id, token, success=True, now=applied_at
+    )
+
+
+def test_menu_buttons_switch_mode_pause_and_list_applications(tmp_path: Path) -> None:
+    telegram, database, control, _ = service(tmp_path, "dry_run")
+
+    assert telegram.menu_text("Парсинг", 42) == (
+        "Режим: парсинг. Новые карточки без кнопок отклика."
+    )
+    assert control.app_mode == "dry_run"
+    assert telegram.menu_text("Апрув", 42) == (
+        "Режим: апрув. Новые карточки с письмом и откликом."
+    )
+    assert control.app_mode == "approval"
+    assert "mode: approval" in telegram.menu_text("Статус", 42)
+    assert telegram.menu_text("Пауза", 42) == "Agent paused."
+    assert control.paused
+    assert telegram.menu_text("Продолжить", 42) == "Agent resumed."
+    assert not control.paused
+    assert telegram.menu_text("Отклики", 42) == "Откликов нет."
+    assert telegram.menu_text("Ожидают", 42) == "No pending vacancies."
+    assert "No search diagnostics recorded." in telegram.menu_text("Диагностика", 42)
+    record_application(database, "old", "Старый SEO", "Old Co", NOW)
+    record_application(
+        database, "new", "Новый SEO", "New Co", NOW + timedelta(hours=1)
+    )
+
+    applied = telegram.menu_text("Отклики", 42)
+
+    assert applied.index("Новый SEO — New Co") < applied.index("Старый SEO — Old Co")
+    assert "https://example.com/vacancy/new" in applied
+    assert telegram.menu_text("Парсинг", 99) == "This bot is private."
+    assert control.app_mode == "approval"
+
+
+def test_start_and_menu_reply_keep_keyboard(tmp_path: Path) -> None:
+    telegram, _, control, _ = service(tmp_path)
+    start = FakeMessage("/start")
+    pause = FakeMessage("Пауза")
+
+    asyncio.run(telegram._command_handler(start))
+    asyncio.run(telegram._text_handler(pause))
+
+    assert start.replies[0]["reply_markup"].keyboard[0][0].text == "Парсинг"
+    assert pause.replies[0]["text"] == "Agent paused."
+    assert pause.replies[0]["reply_markup"].keyboard[1][0].text == "Пауза"
+    assert control.paused
+
+
+def test_letter_edit_consumes_menu_label(tmp_path: Path) -> None:
+    telegram, _, control, _ = service(tmp_path)
+
+    async def scenario() -> None:
+        future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+        telegram._edit_future = future
+        message = FakeMessage("Пауза")
+        await telegram._text_handler(message)
+        assert future.result() == "Пауза"
+        assert message.replies == []
+
+    asyncio.run(scenario())
+    assert not control.paused

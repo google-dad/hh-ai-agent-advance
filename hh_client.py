@@ -234,6 +234,7 @@ class HHClient:
             for page_number in range(self.settings.max_pages_per_query):
                 params: dict[str, Any] = {
                     "text": query,
+                    "search_field": ["name", "company_name"],
                     "order_by": "publication_time",
                     "page": page_number,
                 }

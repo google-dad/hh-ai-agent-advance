@@ -1,111 +1,114 @@
-# HH AI Agent (advance)
+# hh-ai-agent-advance
 
-Форк [fikstt2/hh-ai-agent](https://github.com/fikstt2/hh-ai-agent): агент ищет вакансии на HH.ru, оценивает через LLM, пишет сопроводительные и шлёт подходящие в Telegram.
+Личный форк [fikstt2/hh-ai-agent](https://github.com/fikstt2/hh-ai-agent):  
+https://github.com/google-dad/hh-ai-agent-advance
 
-Репозиторий: [google-dad/hh-ai-agent-advance](https://github.com/google-dad/hh-ai-agent-advance).
+Бот обходит выдачу HH.ru, отсекает мусор по заголовку, открывает карточку в браузере и кидает превью в Telegram. Дальше решаете вы: генерировать письмо, править, откликаться или пропускать.
 
-### Что добавлено в этом форке
+## Чем это не апстрим
 
-- Универсальный пул API-ключей и команда `/keys` для **Mistral** и **OpenAI-compatible** (Together, Groq и т.п.); `/mistral_keys` — алиас
-- Пример и рекомендации для [Together AI](https://www.together.ai/) / reasoning-моделей (`gpt-oss`)
-- Если в `work_format` есть «удалённо» / `remote`, поиск HH идёт с `schedule=remote`
-- Более мягкий LLM-отбор под SEO / linkbuilding / technical SEO / lead-роли
-- Полные сопроводительные: запас `max_output_tokens`, обрезка по границе предложения (не на полуслове)
+В оригинале на **каждую** вакансию вызывается LLM: «подходит / не подходит» плюс сразу сопроводительное. Здесь цикл поиска **не** ходит в модель.
 
-Секреты (`.env`, `profile.yaml`) в Git не входят — настраиваются локально.
+```mermaid
+flowchart LR
+  search[HH_search] --> titleFilter[Title_filter]
+  titleFilter -->|pass| readPage[Read_vacancy_company]
+  titleFilter -->|reject| drop[Skip]
+  readPage --> telegram[Telegram_card]
+  telegram -->|letter_button| llmLetter[LLM_cover_letter]
+  telegram -->|skip| drop
+  llmLetter --> apply[Optional_apply]
+```
 
-## Быстрый старт
+Поиск → локальный фильтр заголовка → страница HH → Telegram.  
+LLM включается **только** после кнопки «Сгенерировать письмо».
 
-```bash
+### Зачем так (токены)
+
+Автооценка каждой вакансии на reasoning-моделях (Together `gpt-oss` и аналоги) сжигает бюджет: длинное описание + профиль + внутренние reasoning-токены — часто впустую. По заголовку и так видно «мимо», а интересные карточки вы всё равно смотрите глазами.
+
+Итог: фильтр и просмотр бесплатны; токены уходят только на письма, которые вы сами запросили.
+
+## Запуск
+
+```powershell
+cd path\to\hh-ai-agent-advance
+py -3.12 -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
 python setup_wizard.py
-```
-
-Wizard спросит:
-1. Токен Telegram-бота и твой User ID
-2. AI-провайдер (Ollama, Mistral или OpenAI-compatible)
-3. Данные профиля для анализа вакансий
-4. Режим работы
-
-Создаст `.env` и `profile.yaml`, проверит конфигурацию.
-
-**Изменить настройки позже:**
-
-```bash
-python setup_wizard.py --edit
-```
-
-На Windows удобнее `py -3.12 -m venv .venv`, затем `.venv\Scripts\activate` и `pip install -r requirements.txt`.
-
-Проверки без полного цикла:
-
-```bash
 python main.py --check-config
 python main.py --check-llm
 python main.py
 ```
 
----
+Wizard пишет локальные `.env` и `profile.yaml` (в Git их нет). Правки позже: `python setup_wizard.py --edit` или руками в YAML.
 
-## Требования
+Нужны: Python 3.11+, Telegram-бот + ваш User ID, браузер (CloakBrowser или `BROWSER_BACKEND=playwright`). LLM — если нужны письма / `/keys` / `--check-llm`.
 
-- Python 3.11+ (рекомендуется 3.12)
-- Telegram Bot ([@BotFather](https://t.me/BotFather))
-- Один из LLM-провайдеров (ниже)
-- [CloakBrowser](https://cloakbrowser.com/) (ставится через wizard)
-
----
-
-## Режимы работы
-
-| Режим | Описание |
+| Режим | Смысл |
 |---|---|
-| `dry_run` | Поиск и анализ, превью в Telegram — **без реальных откликов** |
-| `approval` | Карточка с кнопкой «Откликнуться» — отклик только после твоего нажатия |
+| `dry_run` | Карточки без кнопок отклика |
+| `approval` | Можно генерировать письмо и откликаться |
 
-Начинай с `dry_run`. В Telegram: краткое обоснование, рейтинг компании и сворачиваемое письмо. Если rich messages недоступны — обычная HTML-карточка.
+Реальный отклик только при `APP_MODE=approval` + `ENABLE_REAL_APPLY=true` + кнопка вашим Telegram ID.
 
----
+## profile.yaml — что писать
 
-## Профиль и поиск HH
+Файл создаётся wizard’ом или копированием из [`profile.example.yaml`](profile.example.yaml). Личный профиль в репозиторий не коммитится.
 
-Ключевые поля в `profile.yaml` (локально, не в репозитории):
+### `candidate` — кто вы (в основном для текста письма)
 
-| Поле | Зачем |
-|---|---|
-| `search_queries` / `desired_positions` | Запросы и целевые роли для поиска и LLM |
-| `areas` | Регионы HH — **числовые ID** (`1` = Москва, `2` = СПб). Пустой список = без фильтра по региону |
-| `experience_filters` | Коды HH: `noExperience`, `between1And3`, `between3And6`, `moreThan6`. Пустой список = любой опыт |
-| `work_format` | Если есть «удалённо» / `remote` → в URL поиска добавляется `schedule=remote` |
-| `cover_letter.max_length` | Лимит символов письма (у HH поле до ~10 000; разумный рабочий диапазон 1500–8000) |
+| Поле | Нужно? | За что |
+|---|---|---|
+| `name` | **да** | Имя в промпте письма |
+| `location` | нет | Город / «удалённо» — в письме |
+| `desired_positions` | **да**, список ≠ `[]` | Целевые роли для промпта. Это **не** поисковые строки HH |
+| `experience_summary` | **да** | Краткое резюме опыта — главный блок фактов для LLM |
+| `education` | нет | Образование |
+| `technologies` | нет | Навыки / инструменты |
+| `projects` | нет | Кейсы и проекты |
+| `github_url` | нет | Единственный URL, который можно оставить в письме (остальные ссылки режутся) |
+| `salary_expectation` | нет | Ожидания по ЗП — модель может упомянуть в финале письма |
+| `work_format` | нет | В промпт. Если есть `удалённо` или `remote` — в поиск HH добавляется `schedule=remote` |
+| `excluded_positions` | нет | Доп. стоп-слова в **заголовке** вакансии (плюс встроенный фильтр) |
+| `additional_information` | нет | Свободный текст: занятость, приоритеты, сайт и т.п. |
 
-Поиск идёт по свежим публикациям (`order_by=publication_time`), глубина — `MAX_PAGES_PER_QUERY` / `MAX_VACANCIES_PER_QUERY` из `.env`.
+### `hh` — поиск и отклик
 
----
+| Поле | Нужно? | За что |
+|---|---|---|
+| `resume_name` | **да** | Точное имя резюме в выпадающем списке HH при отклике |
+| `search_queries` | **да** | Запросы поиска; агент проходит по каждому |
+| `areas` | нет | ID регионов HH: `1` Москва, `2` СПб. Пустой `[]` — без геофильтра. Не пишите «Москва» текстом |
+| `experience_filters` | нет | Коды HH: `noExperience`, `between1And3`, `between3And6`, `moreThan6`. `[]` — любой опыт |
 
-## LLM-провайдеры
+### `cover_letter`
 
-### Ollama (локально)
+| Поле | Нужно? | За что |
+|---|---|---|
+| `language` | нет | Язык письма (`ru` по умолчанию) |
+| `max_length` | нет | Лимит символов (дефолт 1800; у HH поле до ~10 000). При превышении — обрезка по концу предложения |
+| `style` | нет | Тон промпта, например `professional` |
 
-1. Установи [Ollama](https://ollama.com/download)
-2. `ollama pull llama3`
-3. В wizard выбери **Ollama**
+Глубина цикла задаётся в `.env`: `CHECK_INTERVAL_MINUTES`, `MAX_PAGES_PER_QUERY`, `MAX_VACANCIES_PER_QUERY`.
 
-`/keys` для Ollama недоступен — ключи не используются.
+## Telegram
 
-### Mistral API
+В `approval` на карточке без письма: **Сгенерировать письмо** / **Пропустить**.  
+После генерации: **Откликнуться** / **Пропустить** / **Изменить письмо**.
 
-1. Ключ на [console.mistral.ai](https://console.mistral.ai/)
-2. В wizard — **Mistral API**
+Команды: `/start`, `/status`, `/pause`, `/resume`, `/pending`, `/stats`, `/diagnostics`, `/keys` (алиас `/mistral_keys`), `/cancel`.
 
-Нужен `LLM_KEYS_MASTER_KEY` (синоним `MISTRAL_KEYS_MASTER_KEY`) — Fernet-ключ для локального шифрования пула. Сохрани бэкап: без него старые ключи не расшифровать. Управление: `/keys`.
+## Модель — только письма
 
-> ⚠️ Текст вакансий и профиль уходят во внешний API.
+На отбор в цикле поиска LLM не влияет.
 
-### OpenAI-compatible (Together, Groq, LM Studio, …)
+- **Ollama** — локально, без `/keys`
+- **Mistral** — ключ + `LLM_KEYS_MASTER_KEY`, пул через `/keys`
+- **OpenAI-compatible** (Together, Groq, …) — тот же пул `/keys`
 
-Любой `/chat/completions`. Ключи тоже в зашифрованном пуле — `/keys`.
-
-Пример Together AI:
+Пример Together:
 
 ```ini
 LLM_PROVIDER=openai_compatible
@@ -117,110 +120,21 @@ LLM_TIMEOUT_SECONDS=90
 LLM_MAX_OUTPUT_TOKENS=4000
 ```
 
-У reasoning-моделей (`gpt-oss` и аналоги) часть `max_tokens` уходит во внутренние рассуждения — держи `LLM_MAX_OUTPUT_TOKENS` с запасом (для писем удобно ≥ 3500–4000). Healthcheck (`python main.py --check-llm`) выделяет до 256 токенов.
+Для reasoning держите `LLM_MAX_OUTPUT_TOKENS` с запасом (≈3500–4000). Healthcheck (`--check-llm`) — до 256 токенов.
 
-> ⚠️ Данные профиля и вакансий уходят к выбранному провайдеру.
+## Если что-то не так
 
----
+- Нет карточек → смотрите логи: фильтр заголовка (`no-role`, стоп-слова), дубли в SQLite, `/pause`, circuit breaker.
+- Нужен логин HH → `BROWSER_HEADLESS=false`, войти вручную.
+- Пустое письмо → ключ/квота/эндпоинт; увеличьте `LLM_MAX_OUTPUT_TOKENS`.
+- Хотите «с нуля» историю → остановите агент, сделайте backup `agent.db`, удалите/переименуйте файл.
 
-## Сопроводительные письма
+Диагностика браузера/LLM вручную: `python -m scripts.browser_smoke`, `python -m scripts.llm_smoke`.
 
-- Промпт просит **законченное** короткое письмо в пределах `cover_letter.max_length`
-- Если ответ всё же длиннее лимита — обрезка по концу предложения / слова, без обрыва на «Ожидаемая…»
-- Перед откликом всегда читай текст в Telegram
+Тесты: `pytest -q` (без HH / Telegram / внешних LLM).
 
----
+## Правовое
 
-## Telegram-команды
+Автоматизация HH.ru может нарушать правила сервиса — риск на вас. Форк не обещает обход детекта и CAPTCHA. Массового авто-отклика нет.
 
-| Команда | Описание |
-|---|---|
-| `/start` | Краткая справка |
-| `/status` | Режим, состояние, статистика |
-| `/pause` / `/resume` | Пауза / продолжение поиска |
-| `/pending` | Вакансии, ожидающие решения |
-| `/stats` | Статистика по статусам |
-| `/diagnostics` | Последний цикл и circuit breaker |
-| `/keys` | Пул API-ключей (Mistral / OpenAI-compatible); алиас `/mistral_keys` |
-| `/cancel` | Отменить ввод CAPTCHA |
-
----
-
-## Архитектура
-
-| Файл | Ответственность |
-|---|---|
-| `config.py` | Валидация `.env` и `profile.yaml` |
-| `browser_backend.py` | CloakBrowser / Playwright |
-| `hh_client.py` | Поиск, страницы, отклики (`schedule=remote` при удалёнке) |
-| `llm/` | Провайдеры, пул ключей, retry, квота |
-| `ai_analyzer.py` | Оценка вакансий, генерация писем |
-| `database.py` | SQLite, лимиты, статусы |
-| `approval.py` | Единственный путь к реальному отклику |
-| `tg_bot.py` | Команды, превью, inline-кнопки |
-| `main.py` | Цикл агента |
-| `setup_wizard.py` | Мастер настройки |
-| `vacancy_filter.py` | Предфильтр по заголовку (stop-words) |
-
----
-
-## Безопасность
-
-- Реальный отклик только при **трёх** условиях: `APP_MODE=approval` + `ENABLE_REAL_APPLY=true` + кнопка твоим Telegram ID (permit ~30 минут)
-- Массового авто-отклика нет
-- `.env`, `profile.yaml`, `.browser-profile/` в `.gitignore`
-- Токены и cookies в логи не пишутся
-
----
-
-## Типичные ошибки
-
-| Ошибка | Решение |
-|---|---|
-| `Configuration error` | `python setup_wizard.py --edit` |
-| `CloakBrowser failed to start` | `python -m cloakbrowser info` или `BROWSER_BACKEND=playwright` |
-| `HH.ru login is required` | `BROWSER_HEADLESS=false`, войти вручную |
-| `LLM check failed` / пустой healthcheck | Проверь URL/ключ; для reasoning увеличь `LLM_MAX_OUTPUT_TOKENS` |
-| `Invalid model response` | Вакансия пропускается без отклика |
-| В Telegram тишина | Смотри логи: stop-words, `suitable=false`, уже обработанные в SQLite |
-
-Сброс локальной истории вакансий (осторожно): останови агент, удали/переименуй `agent.db` (или сделай backup), запусти снова.
-
----
-
-## Разработка
-
-```bash
-python -m compileall .
-pytest -q
-```
-
-Тесты не ходят в HH.ru, Telegram и внешние LLM.
-
----
-
-## Ограничения
-
-- Автоматизация может нарушать правила HH.ru — риск на пользователе
-- CloakBrowser не гарантирует отсутствие детекта / CAPTCHA
-- Нет proxy, GeoIP-ротации и внешних CAPTCHA-сервисов
-- Один владелец, одна SQLite-база
-- Письмо нужно читать перед откликом
-
----
-
-## Благодарности
-
-Основа: **[fikstt2/hh-ai-agent](https://github.com/fikstt2/hh-ai-agent)**.
-
-Спасибо **[kkonstantin08](https://github.com/kkonstantin08)** за архитектуру пайплайна и approval с permit-токенами, и **[danscMax](https://github.com/danscMax)** за проверки и валидацию конфигурации.
-
----
-
-## Контакты
-
-Вопросы по апстриму: **@fikstt3 (telegram)**
-
-## Disclaimer
-
-Автоматизация HH.ru нарушает пользовательское соглашение — используйте на свой страх и риск. Автор форка не несёт ответственности за ограничения аккаунта.
+Основа: [fikstt2/hh-ai-agent](https://github.com/fikstt2/hh-ai-agent). Архитектура approval — [kkonstantin08](https://github.com/kkonstantin08); валидация конфига — [danscMax](https://github.com/danscMax). Апстрим: @fikstt3.

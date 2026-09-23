@@ -30,15 +30,28 @@ class PhysicalApplicationSender(Protocol):
     async def submit_application(self, permission: ApplicationPermission) -> bool: ...
 
 
+class RuntimeMode(Protocol):
+    app_mode: str
+
+
+def runtime_app_mode(settings: Settings, control: RuntimeMode | None) -> str:
+    if control is not None and control.app_mode:
+        return control.app_mode
+    return settings.app_mode
+
+
 class ApprovalGuard:
     def __init__(
         self,
         settings: Settings,
         database: Database,
         now_factory: Callable[[], datetime] | None = None,
+        *,
+        control: RuntimeMode | None = None,
     ):
         self.settings = settings
         self.database = database
+        self.control = control
         self.now_factory = now_factory or (lambda: datetime.now().astimezone())
 
     def claim(self, permission: ApplicationPermission) -> ClaimResult:
@@ -47,7 +60,7 @@ class ApprovalGuard:
             permit=permission.permit,
             telegram_user_id=permission.telegram_user_id,
             expected_user_id=self.settings.tg_user_id,
-            app_mode=self.settings.app_mode,
+            app_mode=runtime_app_mode(self.settings, self.control),
             enable_real_apply=self.settings.enable_real_apply,
             daily_limit=self.settings.max_applications_per_day,
             now=self.now_factory(),
@@ -61,10 +74,13 @@ class ApprovalService:
         database: Database,
         sender: PhysicalApplicationSender,
         now_factory: Callable[[], datetime] | None = None,
+        *,
+        control: RuntimeMode | None = None,
     ):
         self.settings = settings
         self.database = database
         self.sender = sender
+        self.control = control
         self.now_factory = now_factory or (lambda: datetime.now().astimezone())
 
     async def approve_and_apply(
@@ -73,7 +89,7 @@ class ApprovalService:
         if telegram_user_id != self.settings.tg_user_id:
             logger.warning("application_blocked job_id=%s reason=wrong_user", job_id)
             return ApprovalResult(False, "Action is not allowed")
-        if self.settings.app_mode != "approval":
+        if runtime_app_mode(self.settings, self.control) != "approval":
             logger.warning("application_blocked job_id=%s reason=app_mode", job_id)
             return ApprovalResult(False, "Real applications are disabled in dry-run")
         if not self.settings.enable_real_apply:

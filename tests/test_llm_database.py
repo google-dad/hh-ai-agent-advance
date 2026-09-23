@@ -37,6 +37,7 @@ def test_request_reservation_persists_and_in_progress_counts_after_restart(
     reopened = Database(path)
     assert reopened.llm_requests_today(NOW) == 1
     assert reserve(reopened, "cover_letter", limit=1) is None
+    assert reserve(reopened, "cover_letter", limit=0) is not None
 
 
 def test_daily_request_limit_is_reserved_atomically(tmp_path: Path) -> None:
