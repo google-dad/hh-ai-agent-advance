@@ -137,4 +137,4 @@ LLM_MAX_OUTPUT_TOKENS=4000
 
 Автоматизация HH.ru может нарушать правила сервиса — риск на вас. Форк не обещает обход детекта и CAPTCHA. Массового авто-отклика нет.
 
-Основа: [fikstt2/hh-ai-agent](https://github.com/fikstt2/hh-ai-agent). Архитектура approval — [kkonstantin08](https://github.com/kkonstantin08); валидация конфига — [danscMax](https://github.com/danscMax). Апстрим: @fikstt3.
+Референс: [fikstt2/hh-ai-agent](https://github.com/fikstt2/hh-ai-agent). 
